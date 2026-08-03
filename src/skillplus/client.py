@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from urllib.parse import urljoin
 from typing import Any
 
 import httpx
@@ -74,7 +75,6 @@ class SkillPlus:
         wait: bool = False,
         wait_interval: float = 5.0,
         wait_timeout: float = 600.0,
-        preferred_provider: str | None = None,
     ) -> QueryResult:
         """Is there a report? Binary answer: ``found`` (report attached) or
         ``not_found`` (with ``scanning`` telling you whether one is on the way).
@@ -89,23 +89,20 @@ class SkillPlus:
             return self._wait_for_completed(
                 repo_url,
                 skill_path=skill_path,
-                preferred_provider=preferred_provider,
                 prior=None,
                 interval=wait_interval,
                 timeout=wait_timeout,
             )
         payload = self._raw_query(
-            repo_url, skill_path=skill_path,
-            scan_if_missing=scan_if_missing, preferred_provider=preferred_provider,
+            repo_url, skill_path=skill_path, scan_if_missing=scan_if_missing,
         )
-        return _map_server_state(payload)
+        return _map_server_state(payload, self._base_url)
 
     def scan(
         self,
         repo_url: str,
         *,
         skill_path: str | None = None,
-        preferred_provider: str | None = None,
         force: bool = False,
         wait: bool = False,
         wait_interval: float = 5.0,
@@ -125,14 +122,10 @@ class SkillPlus:
             if force:
                 current = self.query(repo_url, skill_path=skill_path)
                 prior = current.report if current.status == "found" else None
-            self._raw_scan(
-                repo_url, skill_path=skill_path,
-                preferred_provider=preferred_provider, force=force,
-            )
+            self._raw_scan(repo_url, skill_path=skill_path, force=force)
             found = self._wait_for_completed(
                 repo_url,
                 skill_path=skill_path,
-                preferred_provider=preferred_provider,
                 prior=prior,
                 interval=wait_interval,
                 timeout=wait_timeout,
@@ -140,10 +133,7 @@ class SkillPlus:
             assert found.report is not None
             return found.report
 
-        payload = self._raw_scan(
-            repo_url, skill_path=skill_path,
-            preferred_provider=preferred_provider, force=force,
-        )
+        payload = self._raw_scan(repo_url, skill_path=skill_path, force=force)
         status = payload.get("status")
         message = payload.get("message") or ""
         if status == "queued":
@@ -158,8 +148,7 @@ class SkillPlus:
         raise SkillPlusError(message or "Scan failed", detail=status)
 
     def _raw_query(
-        self, repo_url: str, *, skill_path: str | None,
-        scan_if_missing: bool, preferred_provider: str | None,
+        self, repo_url: str, *, skill_path: str | None, scan_if_missing: bool,
     ) -> dict[str, Any]:
         return self._request_json(
             "POST",
@@ -168,13 +157,11 @@ class SkillPlus:
                 "repo_url": repo_url,
                 "skill_path": skill_path,
                 "scan_if_missing": scan_if_missing,
-                "preferred_provider": preferred_provider,
             },
         )
 
     def _raw_scan(
-        self, repo_url: str, *, skill_path: str | None,
-        preferred_provider: str | None, force: bool,
+        self, repo_url: str, *, skill_path: str | None, force: bool,
     ) -> dict[str, Any]:
         return self._request_json(
             "POST",
@@ -182,7 +169,6 @@ class SkillPlus:
             json={
                 "repo_url": repo_url,
                 "skill_path": skill_path,
-                "preferred_provider": preferred_provider,
                 "force": force,
             },
         )
@@ -192,7 +178,6 @@ class SkillPlus:
         repo_url: str,
         *,
         skill_path: str | None,
-        preferred_provider: str | None,
         prior: ScanReport | None,
         interval: float,
         timeout: float,
@@ -203,8 +188,7 @@ class SkillPlus:
         deadline = time.monotonic() + timeout
         while True:
             payload = self._raw_query(
-                repo_url, skill_path=skill_path,
-                scan_if_missing=True, preferred_provider=preferred_provider,
+                repo_url, skill_path=skill_path, scan_if_missing=True,
             )
             status = payload.get("status")
             if status == "failed":
@@ -218,7 +202,7 @@ class SkillPlus:
                 and report_payload.get("status") == "completed"
                 and (prior is None or report_payload.get("scanned_at") != prior.scanned_at)
             ):
-                return _map_server_state(payload)
+                return _map_server_state(payload, self._base_url)
             if time.monotonic() + interval > deadline:
                 raise SkillPlusError(
                     f"Timed out waiting for report (last status: {status})",
@@ -230,7 +214,7 @@ class SkillPlus:
         """Retrieve structured report data by scan ID."""
 
         payload = self._request_json("GET", f"/api/report/{scan_id}")
-        return _parse_report(payload)
+        return _parse_report(payload, self._base_url)
 
     def get_badge(self, scan_id: str) -> str:
         """Fetch the badge SVG for a report."""
@@ -241,6 +225,17 @@ class SkillPlus:
         """Return the public badge URL for a report."""
 
         return f"{self._base_url}/api/report/{scan_id}/badge.svg"
+
+    def get_report_page_url(self, scan_id: str) -> str:
+        """Return the report page a person can read — ``/report/<id>``.
+
+        Not the same as ``report.report_url``, which is the API endpoint
+        (``/api/report/<id>``) and returns JSON. Linking a human to that field
+        is an easy mistake to make from its name; this is the link to put in
+        front of one.
+        """
+
+        return f"{self._base_url}/report/{scan_id}"
 
     def _request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         response = self._request(method, path, **kwargs)
@@ -304,14 +299,32 @@ class SkillPlus:
         return response
 
 
-def _map_server_state(payload: dict[str, Any]) -> QueryResult:
+def _absolute(value: str | None, base_url: str) -> str:
+    """Join a path returned by the API onto the client's base URL.
+
+    The API returns ``report_url`` and ``badge_url`` as PATHS ("/api/report/…").
+    Passing those through unchanged means anyone doing the obvious thing — using
+    ``report.badge_url`` in an ``<img>`` — resolves it against THEIR origin and
+    gets a broken image. Absolutise here, the same way this parser already folds
+    legacy ``rating`` onto ``verdict``: a client library exists to hand back
+    values you can use directly.
+
+    ``urljoin`` is a no-op when the value is already absolute, so this stays
+    correct if the API ever changes.
+    """
+    if not value:
+        return ""
+    return urljoin(base_url, value)
+
+
+def _map_server_state(payload: dict[str, Any], base_url: str) -> QueryResult:
     """Fold the server's five-state machine onto the binary query contract."""
     status = payload.get("status")
     if status == "found" and payload.get("report"):
         return QueryResult(
             status="found",
             message=payload.get("message") or "Report found",
-            report=_parse_report(payload["report"]),
+            report=_parse_report(payload["report"], base_url),
             scanning=False,
         )
     return QueryResult(
@@ -322,7 +335,7 @@ def _map_server_state(payload: dict[str, Any]) -> QueryResult:
     )
 
 
-def _parse_report(payload: dict[str, Any]) -> ScanReport:
+def _parse_report(payload: dict[str, Any], base_url: str) -> ScanReport:
     return ScanReport(
         scan_id=payload["scan_id"],
         skill_name=payload["skill_name"],
@@ -339,8 +352,8 @@ def _parse_report(payload: dict[str, Any]) -> ScanReport:
         scan_duration_ms=payload["scan_duration_ms"],
         summary=_parse_summary(payload["summary"]),
         issues=[_parse_issue(issue) for issue in payload.get("issues", [])],
-        report_url=payload["report_url"],
-        badge_url=payload["badge_url"],
+        report_url=_absolute(payload["report_url"], base_url),
+        badge_url=_absolute(payload["badge_url"], base_url),
         blacklisted=bool(payload.get("blacklisted")),
         whitelisted=bool(payload.get("whitelisted")),
         status=payload["status"],

@@ -95,6 +95,7 @@ with SkillPlus(api_key="skp_...") as client:
 | `get_report(scan_id)` | Retrieve a report by id: verdict, findings, AI audit, supply-chain snapshot. |
 | `get_badge(scan_id)` | Fetch the badge SVG for embedding. |
 | `get_badge_url(scan_id)` | Generate a badge URL for READMEs, marketplaces, or internal portals. |
+| `get_report_page_url(scan_id)` | The report page a person can read. The `report_url` field is the API endpoint and returns JSON — use this for links you show a human. |
 
 ## Error handling
 

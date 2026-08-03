@@ -103,15 +103,15 @@ def test_query_sends_auth_and_request_body() -> None:
             "https://github.com/owner/repo",
             skill_path="skills/example",
             scan_if_missing=True,
-            preferred_provider="github",
         )
     request = route.calls.last.request
     assert request.headers["Authorization"] == "Bearer skp_test"
+    # The body is exactly these three keys. An equality assertion, not a subset
+    # one, so a field added back to the request surface fails here.
     assert json.loads(request.read()) == {
         "repo_url": "https://github.com/owner/repo",
         "skill_path": "skills/example",
         "scan_if_missing": True,
-        "preferred_provider": "github",
     }
     assert result.status == "found"
     assert result.scanning is False
@@ -185,6 +185,23 @@ def test_scan_ack_semantics() -> None:
 
 
 @respx.mock
+def test_scan_sends_exactly_three_fields() -> None:
+    # Same guard as the query test: the scan body is these three keys and
+    # nothing else. `preferred_provider` used to ride along here, doing nothing
+    # for any caller who could reach this endpoint.
+    route = respx.post("https://skillplus.xyz/api/sdk/scan").mock(
+        return_value=Response(200, json=SERVER_QUEUED)
+    )
+    with SkillPlus(api_key="skp_test") as client:
+        client.scan("https://skills.sh/o/r/s", skill_path="skills/example", force=True)
+    assert json.loads(route.calls.last.request.read()) == {
+        "repo_url": "https://skills.sh/o/r/s",
+        "skill_path": "skills/example",
+        "force": True,
+    }
+
+
+@respx.mock
 def test_scan_wait_triggers_then_returns_report() -> None:
     scan_route = respx.post("https://skillplus.xyz/api/sdk/scan").mock(
         return_value=Response(200, json=SERVER_QUEUED)
@@ -239,3 +256,11 @@ def test_get_badge_and_badge_url() -> None:
     with SkillPlus(api_key="skp_test") as client:
         assert client.get_badge("scan_123") == "<svg/>"
         assert client.get_badge_url("scan_123") == "https://skillplus.xyz/api/report/scan_123/badge.svg"
+
+
+def test_get_report_page_url_is_not_the_json_endpoint() -> None:
+    # Same scan, two different things: one is for a person, one is for a
+    # program. They must not be equal, or the distinction has been lost.
+    with SkillPlus(api_key="skp_test") as client:
+        assert client.get_report_page_url("scan_123") == "https://skillplus.xyz/report/scan_123"
+        assert client.get_report_page_url("scan_123") != f"{client._base_url}/api/report/scan_123"
